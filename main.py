@@ -26,7 +26,7 @@ from telegram.ext import (
 
 # --- КОНФИГУРАЦИЯ ---
 # Берем из переменных окружения Scalingo
-TOKEN = os.environ.get("TOKEN")
+TOKEN = os.environ.get("8226690823:AAHUbV12-_AM2trJlh8ZHCglmJ4VLcGYRKQ")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # --- ЛОГИРОВАНИЕ ---
