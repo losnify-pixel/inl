@@ -3,10 +3,7 @@ import uuid
 import json
 import asyncio
 import os
-from contextlib import asynccontextmanager
-
-# Библиотеки для базы данных
-from psycopg_pool import AsyncConnectionPool
+import psycopg2
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -26,10 +23,10 @@ from telegram.ext import (
 
 # --- КОНФИГУРАЦИЯ ---
 
-# 👇👇👇 ВСТАВЬ СВОЙ ТОКЕН СЮДА ВНУТРЬ КАВЫЧЕК 👇👇👇
-TOKEN = "8226690823:AAHUbV12-_AM2trJlh8ZHCglmJ4VLcGYRKQ" 
+# 👇👇👇 ВСТАВЬ ТОКЕН СЮДА 👇👇👇
+TOKEN = "8226690823:AAHUbV12-_AM2trJlh8ZHCglmJ4VLcGYRKQ"
 
-# Эту строчку НЕ трогай, Scalingo сам её заполнит при подключении базы
+# Scalingo сам заполнит это, когда подключишь базу
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # --- ЛОГИРОВАНИЕ ---
@@ -37,9 +34,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# --- ГЛОБАЛЬНЫЙ ПУЛ СОЕДИНЕНИЙ ---
-db_pool = None
 
 # --- СОСТОЯНИЯ FSM ---
 (
@@ -54,46 +48,58 @@ db_pool = None
 TYPE_URL = "type_url"
 TYPE_ALERT = "type_alert"
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ (PostgreSQL) ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ (Синхронная обертка) ---
+
+def run_sql(sql, params=None, fetch=False):
+    """Выполняет SQL в отдельном потоке, чтобы не тормозить бота."""
+    if not DATABASE_URL:
+        print("ОШИБКА: Нет подключения к БД (DATABASE_URL)")
+        return None
+
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            if fetch:
+                result = cur.fetchall()
+                return result
+            conn.commit()
+    except Exception as e:
+        logger.error(f"SQL Error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def async_sql(sql, params=None, fetch=False):
+    """Асинхронная обертка для SQL."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, run_sql, sql, params, fetch)
 
 async def init_db():
-    """Создание таблиц при старте."""
-    global db_pool
-    # Создаем пул соединений
-    if not DATABASE_URL:
-        logger.error("DATABASE_URL не найден! Убедись, что добавил PostgreSQL аддон в Scalingo.")
-        return
-
-    db_pool = AsyncConnectionPool(conninfo=DATABASE_URL, open=False)
-    await db_pool.open()
-    
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            # Таблица опросов
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS polls (
-                    poll_id TEXT PRIMARY KEY,
-                    question TEXT,
-                    options TEXT
-                )
-            """)
-            # Таблица голосов
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS votes (
-                    user_id BIGINT,
-                    poll_id TEXT,
-                    option_index INTEGER,
-                    PRIMARY KEY (user_id, poll_id)
-                )
-            """)
-            # Таблица алертов
-            await cur.execute("""
-                CREATE TABLE IF NOT EXISTS alerts (
-                    alert_id TEXT PRIMARY KEY,
-                    text TEXT
-                )
-            """)
-        await conn.commit()
+    """Создание таблиц."""
+    # Таблицы
+    await async_sql("""
+        CREATE TABLE IF NOT EXISTS polls (
+            poll_id TEXT PRIMARY KEY,
+            question TEXT,
+            options TEXT
+        )
+    """)
+    await async_sql("""
+        CREATE TABLE IF NOT EXISTS votes (
+            user_id BIGINT,
+            poll_id TEXT,
+            option_index INTEGER,
+            PRIMARY KEY (user_id, poll_id)
+        )
+    """)
+    await async_sql("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            alert_id TEXT PRIMARY KEY,
+            text TEXT
+        )
+    """)
 
 # --- ЛОГИКА БОТА ---
 
@@ -103,7 +109,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton("📊 Создать опрос", callback_data="create_poll")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "Привет! Я бот для создания inline кнопок в сообщении! Называй меня Alex Doe!"
+    text = "Привет! Я бот для создания inline кнопок! Alex Doe на связи."
     
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
@@ -155,9 +161,7 @@ async def button_content_received(update: Update, context: ContextTypes.DEFAULT_
         keyboard = [[InlineKeyboardButton(btn_text, url=content)]]
     else:
         alert_id = str(uuid.uuid4())[:8]
-        # Используем connection из пула
-        async with db_pool.connection() as conn:
-            await conn.execute("INSERT INTO alerts (alert_id, text) VALUES (%s, %s)", (alert_id, content))
+        await async_sql("INSERT INTO alerts (alert_id, text) VALUES (%s, %s)", (alert_id, content))
         
         callback_data = f"alert:{alert_id}"
         keyboard = [[InlineKeyboardButton(btn_text, callback_data=callback_data)]]
@@ -192,11 +196,10 @@ async def poll_options_received(update: Update, context: ContextTypes.DEFAULT_TY
     question = context.user_data['poll_question']
     poll_id = str(uuid.uuid4())
     
-    async with db_pool.connection() as conn:
-        await conn.execute(
-            "INSERT INTO polls (poll_id, question, options) VALUES (%s, %s, %s)",
-            (poll_id, question, json.dumps(options))
-        )
+    await async_sql(
+        "INSERT INTO polls (poll_id, question, options) VALUES (%s, %s, %s)",
+        (poll_id, question, json.dumps(options))
+    )
     
     keyboard = generate_poll_keyboard(poll_id, options, {})
     await update.message.reply_text(
@@ -225,15 +228,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("alert:"):
         alert_id = data.split(":")[1]
         text = "Ошибка."
-        try:
-            async with db_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT text FROM alerts WHERE alert_id = %s", (alert_id,))
-                    row = await cur.fetchone()
-                    if row: text = row[0]
-        except Exception as e:
-            logger.error(f"DB Error: {e}")
-            
+        rows = await async_sql("SELECT text FROM alerts WHERE alert_id = %s", (alert_id,), fetch=True)
+        if rows:
+            text = rows[0][0]
         await query.answer(text, show_alert=True)
         return
 
@@ -242,41 +239,33 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         option_idx = int(option_idx)
         user_id = query.from_user.id
         
-        try:
-            async with db_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    # 1. Берем опции
-                    await cur.execute("SELECT options FROM polls WHERE poll_id = %s", (poll_id,))
-                    row = await cur.fetchone()
-                    if not row:
-                        await query.answer("Опрос удален.", show_alert=True)
-                        return
-                    options = json.loads(row[0])
+        # 1. Берем опции
+        rows = await async_sql("SELECT options FROM polls WHERE poll_id = %s", (poll_id,), fetch=True)
+        if not rows:
+            await query.answer("Опрос удален.", show_alert=True)
+            return
+        options = json.loads(rows[0][0])
 
-                    # 2. Проверка голоса
-                    await cur.execute("SELECT option_index FROM votes WHERE user_id = %s AND poll_id = %s", (user_id, poll_id))
-                    vote_row = await cur.fetchone()
-                    
-                    if vote_row:
-                        if vote_row[0] == option_idx:
-                            await query.answer("Уже выбрано!")
-                            return
-                        await cur.execute("UPDATE votes SET option_index = %s WHERE user_id = %s AND poll_id = %s", (option_idx, user_id, poll_id))
-                    else:
-                        await cur.execute("INSERT INTO votes (user_id, poll_id, option_index) VALUES (%s, %s, %s)", (user_id, poll_id, option_idx))
-                    
-                    # 3. Подсчет
-                    await cur.execute("SELECT option_index, COUNT(*) FROM votes WHERE poll_id = %s GROUP BY option_index", (poll_id,))
-                    results = await cur.fetchall()
-                
-                votes_summary = {row[0]: row[1] for row in results}
-                
+        # 2. Проверка голоса
+        vote_rows = await async_sql("SELECT option_index FROM votes WHERE user_id = %s AND poll_id = %s", (user_id, poll_id), fetch=True)
+        
+        if vote_rows:
+            if vote_rows[0][0] == option_idx:
+                await query.answer("Уже выбрано!")
+                return
+            await async_sql("UPDATE votes SET option_index = %s WHERE user_id = %s AND poll_id = %s", (option_idx, user_id, poll_id))
+        else:
+            await async_sql("INSERT INTO votes (user_id, poll_id, option_index) VALUES (%s, %s, %s)", (user_id, poll_id, option_idx))
+        
+        # 3. Подсчет
+        results = await async_sql("SELECT option_index, COUNT(*) FROM votes WHERE poll_id = %s GROUP BY option_index", (poll_id,), fetch=True)
+        votes_summary = {row[0]: row[1] for row in results}
+            
+        try:
             new_kb = generate_poll_keyboard(poll_id, options, votes_summary)
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_kb))
             await query.answer("Голос принят")
-        
-        except Exception as e:
-            logger.error(f"Error voting: {e}")
+        except Exception:
             await query.answer()
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -288,8 +277,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main():
     if not DATABASE_URL:
-        print("ОШИБКА: Не задан DATABASE_URL. Убедись, что подключил PostgreSQL в Scalingo (вкладка Addons).")
-        # Мы не делаем return, чтобы процесс упал и ты увидел ошибку в логах, если базы нет
+        print("ОШИБКА: Не задан DATABASE_URL. В Scalingo: вкладка Addons -> добавь PostgreSQL.")
+        # Не выходим, чтобы видеть логи
         
     application = Application.builder().token(TOKEN).build()
 
@@ -299,7 +288,7 @@ def main():
     try:
         loop.run_until_complete(init_db())
     except Exception as e:
-        print(f"ОШИБКА ПОДКЛЮЧЕНИЯ К БД: {e}")
+        print(f"Ошибка старта БД: {e}")
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -321,7 +310,7 @@ def main():
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_callback_query, pattern="^(vote:|alert:)"))
 
-    print("Бот запускается...")
+    print("Бот запускается (psycopg2-binary version)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
