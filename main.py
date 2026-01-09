@@ -27,7 +27,7 @@ from telegram.ext import (
 # --- КОНФИГУРАЦИЯ ---
 
 # 👇👇👇 ВСТАВЬ СВОЙ ТОКЕН СЮДА ВНУТРЬ КАВЫЧЕК 👇👇👇
-TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11" 
+TOKEN = "8226690823:AAHUbV12-_AM2trJlh8ZHCglmJ4VLcGYRKQ" 
 
 # Эту строчку НЕ трогай, Scalingo сам её заполнит при подключении базы
 DATABASE_URL = os.environ.get("DATABASE_URL")
